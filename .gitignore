@@ -1,0 +1,29 @@
+# Per-run outputs — contain resource IDs, request IDs, and region headers.
+runs/
+
+# Local environment configuration — never commit real endpoints / keys.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
