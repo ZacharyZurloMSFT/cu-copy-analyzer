@@ -1,52 +1,32 @@
 # cu-copy-analyzer
 
-A small command-line harness that exercises the **Azure AI Content Understanding** analyzer-copy flow between two Foundry resources and produces a shareable diagnostic report.
-
-Use it to answer: **when a custom analyzer is copied from resource A to resource B, does it end up usable on B?**
+A command-line harness that reproduces the **Azure AI Content Understanding project-scoped analyzer copy bug**: copying a portal-created (project-scoped) analyzer from a source Foundry resource to a target succeeds, but `GET /analyzers/{id}` on the target returns 404 for that analyzer on the preview api-version (and, in some deployments, on the stable api-version too), even though the list endpoint surfaces it.
 
 The harness talks to the Content Understanding REST API directly (no SDK) so you get authentic HTTP status codes, response headers, and timings — which is what an Azure support engineer needs to trace an issue through service logs.
 
 ## What this tests
 
-The harness supports two modes:
+Given two Foundry resources — a **source** (where a portal-created analyzer already lives) and a **target** (typically QA) — `run-all` does the following:
 
-- **`--mode account`** (default): creates a fresh custom analyzer on the **source** resource via account-scope `PUT /analyzers/{id}`, copies it, and verifies. Good baseline.
-- **`--mode project-scoped`**: reuses an existing portal-created (project-scoped) analyzer on the source, copies it to the target, and probes get-by-id on the copied analyzer under **both** api-versions. This reproduces the customer-reported symptom where a project-scoped copied analyzer surfaces in `GET /analyzers` (list) but `GET /analyzers/{id}` returns **404** on both `2025-11-01` and `2026-06-01-preview`.
+1. GETs the existing `SOURCE_ANALYZER_ID` on the **source** and confirms it's `ready`. Captures its `projectId` tag. (No PUT/create — the analyzer must already exist.)
+2. Grants copy authorization on the source.
+3. Copies source → target and polls the copy operation to completion.
+4. On the target, runs the diagnostic matrix on the copied analyzer:
 
-Given two Foundry resources (a **source** and a **target**), `run-all` does the following on your behalf:
+   | Auth | api-version | List shows it? | GET by-id | analyze-by-id |
+   |---|---|---|---|---|
+   | entra | primary (`API_VERSION`) | expect `ready` | expect 200 | expect 202 |
+   | entra | preview (`PREVIEW_API_VERSION`) | expect `ready` | expect 200 | — |
+   | key _(if `TARGET_KEY` set)_ | primary | expect `ready` | expect 200 | — |
 
-1. Creates a small custom analyzer on the **source** resource and waits for it to become `ready` — OR, in project-scoped mode, verifies the pre-existing `SOURCE_ANALYZER_ID` is ready and captures its `projectId` tag.
-2. Creates the same analyzer natively on the **target** resource (a control) and waits for it to become `ready`.
-3. Grants copy authorization on the source.
-4. Copies source → target and polls the copy operation to completion.
-5. On the target, runs a diagnostic matrix for both the **copied** analyzer and the **native** control:
-
-   | Analyzer | Auth | api-version | List shows it? | GET by-id | analyze-by-id |
-   |---|---|---|---|---|---|
-   | copied  | entra | primary | expect `ready` | expect 200 | expect 202 |
-   | copied  | entra | preview _(project-scoped only)_ | expect `ready` | expect 200 | — |
-   | copied  | key _(if `TARGET_KEY` set)_ | primary | expect `ready` | expect 200 | — |
-   | native  | entra | primary | expect `ready` | expect 200 | expect 202 |
-
-6. Writes a `report.md` with the diagnostic matrix, request IDs, timestamps, region headers, list-tag `projectId`, and a verdict of either **Copy Pipeline Succeeded** or **Copy Pipeline Failed**.
-
-If you also provide the target's API key in `.env`, the harness re-runs the copied-analyzer get-by-id **twice** — once under Entra token auth, once under API-key auth — to isolate whether any failure is auth-path specific.
+5. Writes `report.md` with the diagnostic matrix, `x-ms-request-id` values, region headers, projectId tags, and a verdict of either **Copy Pipeline Succeeded** or **Copy Pipeline Failed** (fails if get-by-id 404s on either api-version).
 
 ## Prerequisites
 
-1. **Two Azure AI Foundry (Cognitive Services) resources** you own — one to act as the source, one as the target. Both must have Content Understanding enabled and the model defaults deployed (see step 4 below).
+1. **Two Azure AI Foundry (Cognitive Services) resources** you own — the **source** must already have a portal-created (project-scoped) analyzer on it. The **target** is where the analyzer is copied to (typically your QA resource).
 2. **Python 3.10+**.
 3. **Azure CLI** (`az`) signed in to the tenant that owns both resources.
-4. Both resources have CU model defaults deployed. If you're not sure, deploy them once per resource:
-   ```powershell
-   $token = az account get-access-token --resource https://cognitiveservices.azure.com --query accessToken -o tsv
-   curl.exe -X PATCH `
-     "https://<resource-name>.services.ai.azure.com/contentunderstanding/defaults?api-version=2025-11-01" `
-     -H "Authorization: Bearer $token" `
-     -H "Content-Type: application/json" -d '{}'
-   ```
-   Repeat for both resources. See the [CU REST reference](https://learn.microsoft.com/en-us/rest/api/contentunderstanding/) for details.
-5. The identity you're signed in as has the **`Cognitive Services User`** role on **both** resources. Cognitive Services data-plane calls (which is what this harness makes) require this role explicitly — Owner/Contributor alone is not sufficient.
+4. The identity you're signed in as has the **`Cognitive Services User`** role on **both** resources. Cognitive Services data-plane calls (which is what this harness makes) require this role explicitly — Owner/Contributor alone is not sufficient.
    ```powershell
    $me = az ad signed-in-user show --query id -o tsv
 
@@ -68,40 +48,32 @@ python -m venv .venv
 pip install -r requirements.txt
 
 Copy-Item .env.example .env     # macOS/Linux: cp .env.example .env
-# then edit .env and fill in your two resources' endpoints, resource IDs, and regions
+# then edit .env — fill in both resources and SOURCE_ANALYZER_ID
 ```
 
 ### `.env` fields
 
 | Variable | Required | Description |
 |---|---|---|
+| `API_VERSION` | no | Primary api-version. Defaults to `2025-11-01`. |
+| `PREVIEW_API_VERSION` | no | Second api-version probed during verify. Defaults to `2026-06-01-preview`. |
 | `SOURCE_ENDPOINT` | yes | Full source endpoint, e.g. `https://myresource.services.ai.azure.com` |
 | `SOURCE_RESOURCE_ID` | yes | Full ARM resource ID of the source (`/subscriptions/.../accounts/<name>`) |
-| `SOURCE_REGION` | yes | Azure region of the source resource, e.g. `eastus2` |
+| `SOURCE_REGION` | yes | Azure region of the source, e.g. `eastus2` |
 | `SOURCE_AUTH_MODE` | no | `entra` (default) or `key` |
 | `SOURCE_KEY` | if `SOURCE_AUTH_MODE=key` | Ocp-Apim key for the source |
-| `TARGET_ENDPOINT` / `TARGET_RESOURCE_ID` / `TARGET_REGION` / `TARGET_AUTH_MODE` / `TARGET_KEY` | same as above | For the target resource |
-| `API_VERSION` | no | Primary api-version. Defaults to `2025-11-01`. |
-| `PREVIEW_API_VERSION` | no | Second api-version probed during **project-scoped** verify. Defaults to `2026-06-01-preview`. |
-| `SOURCE_ANALYZER_ID` | if `--mode project-scoped` | Id of an existing portal-created analyzer on the source resource (e.g. `LSC_LP_Test1`). The harness will not PUT/create it — it copies it as-is. |
-| `SOURCE_PROJECT_ID` | no | Informational only — surfaced in `report.md`. The actual project scoping is determined by the portal-created analyzer itself. |
-| `COMPLETION_MODEL` | no | Completion model name for the `generate` field. Defaults to `gpt-4o-mini`. Must be deployed on **both** resources. |
-| `EMBEDDING_MODEL` | no | Embedding model name. Defaults to `text-embedding-3-large`. Must be deployed on **both** resources. |
-| `ANALYZER_BASE_NAME` | no | Prefix for the analyzer IDs the harness creates. Defaults to `cu_copy_repro`. |
+| `SOURCE_ANALYZER_ID` | **yes** | Id of an existing portal-created analyzer on the source (e.g. `COQAnalyzerV1`). The harness will not create this — it copies it as-is. |
+| `SOURCE_PROJECT_ID` | no | Informational only — surfaced in `report.md`. The actual project scoping comes from the analyzer's tags on the source. |
+| `TARGET_ENDPOINT` / `TARGET_RESOURCE_ID` / `TARGET_REGION` / `TARGET_AUTH_MODE` / `TARGET_KEY` | same as source | For the target (QA) resource |
 
-**Tip:** even if you're using Entra auth as primary, setting `TARGET_KEY` unlocks the extra Entra-vs-key comparison in the diagnostic matrix.
+**Tip:** even if you're using Entra auth as primary, setting `TARGET_KEY` unlocks the extra entra-vs-key comparison for get-by-id on the copied analyzer.
 
 ## Run it
 
 ### End-to-end (recommended)
 
 ```powershell
-# Default: account-scope source (fresh PUT), matches original harness behavior.
 python repro.py run-all
-
-# Project-scoped: reuse an existing portal-created analyzer on the source.
-# Requires SOURCE_ANALYZER_ID (and optionally SOURCE_PROJECT_ID) in .env.
-python repro.py --mode project-scoped run-all
 ```
 
 At the end you'll see either
@@ -125,8 +97,7 @@ Every subcommand accepts `--run-id <id>` so you can replay individual steps agai
 ```powershell
 $RID = "20260724T190000Z"
 
-python repro.py --run-id $RID create-source
-python repro.py --run-id $RID create-native
+python repro.py --run-id $RID verify-source
 python repro.py --run-id $RID grant
 python repro.py --run-id $RID copy
 python repro.py --run-id $RID verify
@@ -140,16 +111,16 @@ State is persisted between subcommands in `runs/<RUN_ID>/state.json`.
 python repro.py --run-id $RID cleanup
 ```
 
-Deletes the three analyzers the harness created on the two resources. 404s are tolerated. In **project-scoped** mode the source analyzer is **not** deleted (it's customer-owned) — only the native control and the copied analyzer on the target are removed.
+Deletes the **copied** analyzer on the target. The **source** analyzer is never touched (it's portal-owned by you and shouldn't be deleted by this tool). 404s are tolerated.
 
 ## What to send back to Azure support
 
 Two files per run:
 
-- `runs/<RUN_ID>/report.md` — human-readable summary with the diagnostic matrix, `x-ms-request-id` values, region headers, and verdict.
-- `runs/<RUN_ID>/http_log.ndjson` — one JSON line per HTTP call, with request bodies, response bodies, all captured headers, and UTC timestamps.
+- `runs/<RUN_ID>/report.md` — human-readable summary with the diagnostic matrix, `x-ms-request-id` values, region headers, projectId tags, and verdict.
+- `runs/<RUN_ID>/http_log.ndjson` — one JSON line per HTTP call, with request bodies, response bodies, all captured headers, api-version, and UTC timestamps.
 
-Together they give the service team enough to pull backend logs for both the copy operation and any failing get-by-id / analyze-by-id call.
+Together they give the service team enough to pull backend logs for both the copy operation and any failing get-by-id call — with the specific api-version that produced each result.
 
 ### Privacy note
 
@@ -160,12 +131,12 @@ Together they give the service team enough to pull backend logs for both the cop
 
 | Symptom | Fix |
 |---|---|
+| `Missing or placeholder env var: SOURCE_ANALYZER_ID` | Set `SOURCE_ANALYZER_ID` in `.env` to the exact id of a portal-created analyzer on the source resource. |
+| `Source analyzer <id> not found on source resource` | Typo in `SOURCE_ANALYZER_ID`, wrong `SOURCE_ENDPOINT`, or the identity you're signed in as doesn't have `Cognitive Services User` on the source. |
 | `DefaultAzureCredential` fails or you get `AADSTS…` | `az login --tenant <tenant-id>` and set `$env:AZURE_TENANT_ID` to pin the tenant. |
 | `403` on any call | `Cognitive Services User` role missing on that resource (or not yet propagated — wait ~60s). |
-| PUT analyzer returns `400 InvalidFieldSchema` / `defaults` | Run the CU `PATCH /defaults` step in prerequisites for that resource. |
-| PUT analyzer returns `400 InvalidBaseAnalyzerId` | The `baseAnalyzerId` isn't available at your API version on this resource. Check available prebuilts with `GET /contentunderstanding/analyzers?api-version=2025-11-01`. |
-| Analyzer creation ends `status=failed` | Usually a missing completion/embedding model on the resource. Check `_analyzer_body()` in `repro.py`, or override with `COMPLETION_MODEL` / `EMBEDDING_MODEL` in `.env`. |
 | Copy LRO stays `Running` past 10 minutes | The poller times out; bump `timeout_s` in `cu_client.py::poll_operation` or inspect the last polled body in `http_log.ndjson`. |
+| Copy succeeds but verdict is "Failed" | That's the reproduction — check the diagnostic matrix in `report.md` to see which api-version's get-by-id returned 404. Share the report + NDJSON log with Azure support. |
 
 ## Files
 
