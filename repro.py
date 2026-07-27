@@ -60,15 +60,19 @@ def _analyzer_body() -> dict:
 @dataclass
 class Settings:
     api_version: str
+    preview_api_version: str
     base_name: str
     source: ResourceConfig
     target: ResourceConfig
     target_key: Optional[str]  # separate from target.key if primary auth mode is entra
+    source_analyzer_id: Optional[str] = None  # required for --mode project-scoped
+    source_project_id: Optional[str] = None   # informational only
 
     @staticmethod
     def load() -> "Settings":
         load_dotenv()
         api_version = os.getenv("API_VERSION", "2025-11-01")
+        preview_api_version = os.getenv("PREVIEW_API_VERSION", "2026-06-01-preview")
         base_name = os.getenv("ANALYZER_BASE_NAME", "cu_copy_repro")
 
         def build(name: str) -> ResourceConfig:
@@ -93,10 +97,13 @@ class Settings:
         target_key = os.getenv("TARGET_KEY") or None
         return Settings(
             api_version=api_version,
+            preview_api_version=preview_api_version,
             base_name=base_name,
             source=source,
             target=target,
             target_key=target_key,
+            source_analyzer_id=(os.getenv("SOURCE_ANALYZER_ID") or None),
+            source_project_id=(os.getenv("SOURCE_PROJECT_ID") or None),
         )
 
 
@@ -142,7 +149,15 @@ def _save_state(run_id: str, state: dict) -> None:
         json.dump(state, fh, indent=2, default=str)
 
 
-def _analyzer_ids(base_name: str, run_id: str) -> dict[str, str]:
+def _analyzer_ids(base_name: str, run_id: str, settings: Optional["Settings"] = None, mode: str = "account") -> dict[str, str]:
+    if mode == "project-scoped" and settings is not None and settings.source_analyzer_id:
+        src_id = settings.source_analyzer_id
+        return {
+            "src": src_id,
+            "native": f"{base_name}_{run_id}_native",
+            # Keep the copied name deterministic and traceable to the source.
+            "copied": f"{src_id}_copied_{run_id}",
+        }
     return {
         "src": f"{base_name}_{run_id}_src",
         "native": f"{base_name}_{run_id}_native",
@@ -167,11 +182,55 @@ def _make_clients(settings: Settings, run_id: str) -> tuple[CUClient, CUClient, 
 # ---------------------------------------------------------------------------
 
 
-def cmd_create_source(settings: Settings, run_id: str) -> dict:
+def cmd_create_source(settings: Settings, run_id: str, mode: str = "account") -> dict:
     src, _, _ = _make_clients(settings, run_id)
     state = _load_state(run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
+    state["mode"] = mode
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
     state["analyzers"].update(ids)
+
+    if mode == "project-scoped":
+        if not settings.source_analyzer_id:
+            raise SystemExit(
+                "--mode project-scoped requires SOURCE_ANALYZER_ID in .env (the id of an "
+                "existing portal-created analyzer on the source resource)."
+            )
+        print(f"[source] project-scoped mode: reusing existing analyzer {ids['src']}")
+        # Verify it exists and is ready — do NOT PUT.
+        resp = src.get_analyzer(ids["src"], tolerate_404=True, label=f"verify-existing:{ids['src']}")
+        if resp.status == 404:
+            raise SystemExit(
+                f"Source analyzer {ids['src']!r} not found on source resource "
+                f"(GET returned 404). Check SOURCE_ANALYZER_ID and SOURCE_ENDPOINT."
+            )
+        body = resp.body if isinstance(resp.body, dict) else {}
+        status = str(body.get("status", "")).lower()
+        # Capture projectId tag from source, if present — informational for the report.
+        tags = body.get("tags") or {}
+        source_project_id = tags.get("projectId") if isinstance(tags, dict) else None
+        state["source_analyzer_details"] = {
+            "analyzer_id": ids["src"],
+            "status": body.get("status"),
+            "project_id_from_tags": source_project_id,
+            "project_id_from_env": settings.source_project_id,
+        }
+        if status != "ready":
+            raise SystemExit(
+                f"Existing source analyzer {ids['src']} is not ready (status={body.get('status')}). "
+                f"Fix it in the portal before running the copy repro."
+            )
+        print(f"[source] {ids['src']} -> {body.get('status')} (projectId={source_project_id})")
+        state["events"].append({
+            "step": "create_source",
+            "mode": mode,
+            "analyzer_id": ids["src"],
+            "status": body.get("status"),
+            "project_id": source_project_id,
+        })
+        _save_state(run_id, state)
+        return state
+
+    # account mode (default) — original behavior.
     print(f"[source] creating {ids['src']}")
     src.create_or_replace_analyzer(ids["src"], _analyzer_body())
     print(f"[source] polling {ids['src']} for ready…")
@@ -180,15 +239,16 @@ def cmd_create_source(settings: Settings, run_id: str) -> dict:
     print(f"[source] {ids['src']} -> {status}")
     if str(status).lower() != "ready":
         raise SystemExit(f"Source analyzer did not become ready (status={status})")
-    state["events"].append({"step": "create_source", "analyzer_id": ids["src"], "status": status})
+    state["events"].append({"step": "create_source", "mode": mode, "analyzer_id": ids["src"], "status": status})
     _save_state(run_id, state)
     return state
 
 
-def cmd_create_native(settings: Settings, run_id: str) -> dict:
+def cmd_create_native(settings: Settings, run_id: str, mode: str = "account") -> dict:
     _, tgt, _ = _make_clients(settings, run_id)
     state = _load_state(run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
+    state["mode"] = mode
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
     state["analyzers"].update(ids)
     print(f"[target] creating native control {ids['native']}")
     tgt.create_or_replace_analyzer(ids["native"], _analyzer_body())
@@ -203,10 +263,11 @@ def cmd_create_native(settings: Settings, run_id: str) -> dict:
     return state
 
 
-def cmd_grant(settings: Settings, run_id: str) -> dict:
+def cmd_grant(settings: Settings, run_id: str, mode: str = "account") -> dict:
     src, _, _ = _make_clients(settings, run_id)
     state = _load_state(run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
+    state["mode"] = mode
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
     print(f"[source] granting copy authorization for {ids['src']} -> {settings.target.resource_id}")
     resp = src.grant_copy_authorization(
         source_analyzer_id=ids["src"],
@@ -220,10 +281,11 @@ def cmd_grant(settings: Settings, run_id: str) -> dict:
     return state
 
 
-def cmd_copy(settings: Settings, run_id: str) -> dict:
+def cmd_copy(settings: Settings, run_id: str, mode: str = "account") -> dict:
     _, tgt, _ = _make_clients(settings, run_id)
     state = _load_state(run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
+    state["mode"] = mode
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
     print(f"[target] copying {ids['src']} -> {ids['copied']}")
     resp = tgt.copy_analyzer(
         target_analyzer_id=ids["copied"],
@@ -257,48 +319,75 @@ def cmd_copy(settings: Settings, run_id: str) -> dict:
     return state
 
 
-def _verify_pair(tgt: CUClient, analyzer_id: str, *, kind: str, target_key: Optional[str]) -> list[dict]:
-    """Run list-shows / get-by-id / analyze-by-id for one analyzer, returning matrix rows."""
+def _verify_pair(
+    tgt: CUClient,
+    analyzer_id: str,
+    *,
+    kind: str,
+    target_key: Optional[str],
+    api_versions: list[tuple[str, str]],
+) -> tuple[list[dict], Optional[str]]:
+    """Run list-shows / get-by-id / analyze-by-id for one analyzer.
+
+    Returns (matrix_rows, list_projectId). Each api-version × auth-mode
+    combination produces its own row. `api_versions` is a list of
+    (label, version) tuples — the first entry is treated as the "primary"
+    and is the only one that also runs analyze-by-id (to avoid piling up
+    duplicate LRO submissions across api-versions).
+    """
     rows: list[dict] = []
 
     listed = tgt.list_analyzers(label=f"verify-list:{analyzer_id}")
     ids_in_list = _extract_analyzer_ids(listed.body)
     list_status_for_id = _list_shows_status(listed.body, analyzer_id)
+    list_project_id = _list_shows_project_id(listed.body, analyzer_id)
 
-    def one(auth_mode: Optional[str], auth_label: str) -> dict:
+    def one(auth_mode: Optional[str], auth_label: str, api_version_label: str, api_version: str, run_analyze: bool) -> dict:
         get_resp = tgt.get_analyzer(
             analyzer_id,
             tolerate_404=True,
             auth_override=auth_mode,
-            label=f"verify-get[{auth_label}]:{analyzer_id}",
+            label=f"verify-get[{auth_label}][{api_version_label}]:{analyzer_id}",
+            api_version_override=api_version,
         )
-        analyze_resp = tgt.analyze(analyzer_id, ANALYZE_SAMPLE_URL, tolerate_404=True)
+        analyze_status: Optional[int] = None
+        analyze_request_id: Optional[str] = None
+        if run_analyze:
+            analyze_resp = tgt.analyze(analyzer_id, ANALYZE_SAMPLE_URL, tolerate_404=True)
+            analyze_status = analyze_resp.status
+            analyze_request_id = analyze_resp.headers.get("x-ms-request-id")
         return {
             "kind": kind,
             "analyzer_id": analyzer_id,
             "auth": auth_label,
+            "api_version": api_version,
+            "api_version_label": api_version_label,
             "list_present": analyzer_id in ids_in_list,
             "list_status": list_status_for_id,
+            "list_project_id": list_project_id,
             "get_status": get_resp.status,
             "get_x_ms_request_id": get_resp.headers.get("x-ms-request-id"),
             "get_apim_request_id": get_resp.headers.get("apim-request-id"),
             "get_x_ms_region": get_resp.headers.get("x-ms-region"),
-            "get_start_utc": None,  # timestamps live in http_log.ndjson; kept here for optional enrichment
-            "analyze_status": analyze_resp.status,
-            "analyze_x_ms_request_id": analyze_resp.headers.get("x-ms-request-id"),
+            "get_start_utc": None,
+            "analyze_status": analyze_status,
+            "analyze_x_ms_request_id": analyze_request_id,
         }
 
-    rows.append(one(None, tgt.config.auth_mode))
+    primary_label, primary_version = api_versions[0]
+    rows.append(one(None, tgt.config.auth_mode, primary_label, primary_version, run_analyze=True))
+    for extra_label, extra_version in api_versions[1:]:
+        rows.append(one(None, tgt.config.auth_mode, extra_label, extra_version, run_analyze=False))
+
     if kind == "copied" and target_key and tgt.config.auth_mode == "entra":
-        # Extra apples-to-apples comparison under key auth.
-        # Temporarily attach the key so auth_override="key" works.
+        # Extra apples-to-apples comparison under key auth (primary api-version only).
         original_key = tgt.config.key
         tgt.config.key = target_key
         try:
-            rows.append(one("key", "key"))
+            rows.append(one("key", "key", primary_label, primary_version, run_analyze=False))
         finally:
             tgt.config.key = original_key
-    return rows
+    return rows, list_project_id
 
 
 def _extract_analyzer_ids(body: Any) -> set[str]:
@@ -330,36 +419,74 @@ def _list_shows_status(body: Any, analyzer_id: str) -> Optional[str]:
     return None
 
 
-def cmd_verify(settings: Settings, run_id: str) -> dict:
+def _list_shows_project_id(body: Any, analyzer_id: str) -> Optional[str]:
+    items: list = []
+    if isinstance(body, dict):
+        items = body.get("value") or body.get("analyzers") or []
+    elif isinstance(body, list):
+        items = body
+    for it in items:
+        if isinstance(it, dict) and (it.get("analyzerId") == analyzer_id or it.get("id") == analyzer_id):
+            tags = it.get("tags")
+            if isinstance(tags, dict):
+                return tags.get("projectId")
+            return None
+    return None
+
+
+def cmd_verify(settings: Settings, run_id: str, mode: str = "account") -> dict:
     _, tgt, _ = _make_clients(settings, run_id)
     state = _load_state(run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
+    state["mode"] = mode
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
+
+    # Copied analyzer: hit both api-versions to distinguish get-by-id resolution
+    # behavior. Native control: single api-version is enough (control case).
+    copied_versions: list[tuple[str, str]] = [("primary", settings.api_version)]
+    if settings.preview_api_version and settings.preview_api_version != settings.api_version:
+        copied_versions.append(("preview", settings.preview_api_version))
+    native_versions: list[tuple[str, str]] = [("primary", settings.api_version)]
 
     matrix: list[dict] = []
-    matrix.extend(_verify_pair(tgt, ids["copied"], kind="copied", target_key=settings.target_key))
-    matrix.extend(_verify_pair(tgt, ids["native"], kind="native", target_key=settings.target_key))
+    copied_rows, copied_list_project_id = _verify_pair(
+        tgt, ids["copied"], kind="copied", target_key=settings.target_key, api_versions=copied_versions
+    )
+    matrix.extend(copied_rows)
+    native_rows, native_list_project_id = _verify_pair(
+        tgt, ids["native"], kind="native", target_key=settings.target_key, api_versions=native_versions
+    )
+    matrix.extend(native_rows)
     state["diagnostic_matrix"] = matrix
-    state["events"].append({"step": "verify", "row_count": len(matrix)})
+    state["target_list_project_ids"] = {
+        "copied": copied_list_project_id,
+        "native": native_list_project_id,
+    }
+    state["events"].append({"step": "verify", "row_count": len(matrix), "mode": mode})
     _save_state(run_id, state)
 
     for row in matrix:
         print(
-            f"[verify] {row['kind']}/{row['auth']}: list_present={row['list_present']} "
-            f"list_status={row['list_status']} get={row['get_status']} analyze={row['analyze_status']}"
+            f"[verify] {row['kind']}/{row['auth']}/{row['api_version_label']}({row['api_version']}): "
+            f"list_present={row['list_present']} list_status={row['list_status']} "
+            f"list_projectId={row['list_project_id']} get={row['get_status']} "
+            f"analyze={row['analyze_status']}"
         )
     return state
 
 
-def cmd_cleanup(settings: Settings, run_id: str) -> None:
+def cmd_cleanup(settings: Settings, run_id: str, mode: str = "account") -> None:
     src, tgt, _ = _make_clients(settings, run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
-    print(f"[cleanup] deleting analyzers for run {run_id}")
-    for aid in (ids["src"],):
-        try:
-            r = src.delete_analyzer(aid)
-            print(f"[cleanup] SOURCE delete {aid} -> {r.status}")
-        except CUHttpError as exc:
-            print(f"[cleanup] SOURCE delete {aid} failed: {exc}")
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
+    print(f"[cleanup] deleting analyzers for run {run_id} (mode={mode})")
+    if mode == "project-scoped":
+        print(f"[cleanup] SOURCE delete SKIPPED for {ids['src']} — source is a customer-owned project-scoped analyzer")
+    else:
+        for aid in (ids["src"],):
+            try:
+                r = src.delete_analyzer(aid)
+                print(f"[cleanup] SOURCE delete {aid} -> {r.status}")
+            except CUHttpError as exc:
+                print(f"[cleanup] SOURCE delete {aid} failed: {exc}")
     for aid in (ids["native"], ids["copied"]):
         try:
             r = tgt.delete_analyzer(aid)
@@ -373,15 +500,15 @@ def cmd_cleanup(settings: Settings, run_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def cmd_run_all(settings: Settings, run_id: str) -> Path:
+def cmd_run_all(settings: Settings, run_id: str, mode: str = "account") -> Path:
     _run_dir(run_id).mkdir(parents=True, exist_ok=True)
-    print(f"=== run-all RUN_ID={run_id} ===")
-    cmd_create_source(settings, run_id)
-    cmd_create_native(settings, run_id)
-    cmd_grant(settings, run_id)
-    cmd_copy(settings, run_id)
-    cmd_verify(settings, run_id)
-    report = write_report(settings, run_id)
+    print(f"=== run-all RUN_ID={run_id} mode={mode} ===")
+    cmd_create_source(settings, run_id, mode)
+    cmd_create_native(settings, run_id, mode)
+    cmd_grant(settings, run_id, mode)
+    cmd_copy(settings, run_id, mode)
+    cmd_verify(settings, run_id, mode)
+    report = write_report(settings, run_id, mode)
     verdict = _determine_verdict(_load_state(run_id))
     print(f"\n=== VERDICT: {verdict} ===")
     print(f"Report: {report}")
@@ -391,43 +518,49 @@ def cmd_run_all(settings: Settings, run_id: str) -> Path:
 def _determine_verdict(state: dict) -> str:
     """Success only when the copied analyzer is retrievable end-to-end.
 
-    Any failure — 404 on get-by-id, missing matrix, native control failing,
-    etc. — reports as "Copy Pipeline Failed" since there are multiple
-    reasons a copy pipeline can fall over.
+    In project-scoped mode we require get-by-id to succeed under BOTH
+    api-versions (that's the whole point of the reproduction). In account
+    mode we keep the original single-api-version pass criterion.
     """
     matrix = state.get("diagnostic_matrix") or []
-    copied_entra = next(
-        (r for r in matrix if r["kind"] == "copied" and r["auth"] in ("entra",)),
-        None,
-    )
     native_row = next((r for r in matrix if r["kind"] == "native"), None)
-    if copied_entra is None or native_row is None:
+    copied_rows = [r for r in matrix if r["kind"] == "copied" and r["auth"] not in ("key",)]
+    if not copied_rows or native_row is None:
         return "Copy Pipeline Failed"
-    copied_ok = copied_entra["get_status"] == 200 and copied_entra["analyze_status"] == 202
+
+    primary = next((r for r in copied_rows if r["api_version_label"] == "primary"), None)
+    if primary is None:
+        return "Copy Pipeline Failed"
+    copied_primary_ok = primary["get_status"] == 200 and primary["analyze_status"] == 202
     native_ok = native_row["get_status"] == 200
-    if copied_ok and native_ok:
+
+    # If a preview api-version was tested, require it to succeed too.
+    preview = next((r for r in copied_rows if r["api_version_label"] == "preview"), None)
+    copied_preview_ok = preview is None or preview["get_status"] == 200
+
+    if copied_primary_ok and copied_preview_ok and native_ok:
         return "Copy Pipeline Succeeded"
     return "Copy Pipeline Failed"
 
 
-def write_report(settings: Settings, run_id: str) -> Path:
+def write_report(settings: Settings, run_id: str, mode: str = "account") -> Path:
     state = _load_state(run_id)
-    ids = _analyzer_ids(settings.base_name, run_id)
+    ids = _analyzer_ids(settings.base_name, run_id, settings, mode)
     matrix = state.get("diagnostic_matrix") or []
     verdict = _determine_verdict(state)
 
     copy_info = state.get("copy") or {}
     copy_headers = copy_info.get("initial_headers") or {}
 
-    copied_get = next(
-        (r for r in matrix if r["kind"] == "copied" and r["auth"] in ("entra",)),
-        None,
-    )
+    copied_rows = [r for r in matrix if r["kind"] == "copied" and r["auth"] not in ("key",)]
+    copied_primary = next((r for r in copied_rows if r["api_version_label"] == "primary"), None)
+    copied_preview = next((r for r in copied_rows if r["api_version_label"] == "preview"), None)
 
     lines: list[str] = []
     lines.append(f"# CU Copy Analyzer Repro Report — {run_id}")
     lines.append("")
     lines.append(f"**Verdict:** {verdict}")
+    lines.append(f"**Mode:** `{mode}`")
     lines.append("")
     lines.append("## Resources")
     lines.append("")
@@ -437,14 +570,35 @@ def write_report(settings: Settings, run_id: str) -> Path:
     lines.append(f"- **Target endpoint:** {settings.target.endpoint}")
     lines.append(f"- **Target resource ID:** `{settings.target.resource_id}`")
     lines.append(f"- **Target region:** {settings.target.region}")
-    lines.append(f"- **API version:** {settings.api_version}")
+    lines.append(f"- **API version (primary):** {settings.api_version}")
+    if mode == "project-scoped":
+        lines.append(f"- **API version (preview, verify-only):** {settings.preview_api_version}")
     lines.append("")
     lines.append("## Analyzer IDs")
     lines.append("")
-    lines.append(f"- Source: `{ids['src']}`")
+    lines.append(f"- Source: `{ids['src']}`" + (" _(existing portal-created; not deleted on cleanup)_" if mode == "project-scoped" else ""))
     lines.append(f"- Native (control on target): `{ids['native']}`")
     lines.append(f"- Copied (on target): `{ids['copied']}`")
     lines.append("")
+
+    if mode == "project-scoped":
+        details = state.get("source_analyzer_details") or {}
+        list_projects = state.get("target_list_project_ids") or {}
+        lines.append("## Project scoping")
+        lines.append("")
+        lines.append(f"- **Source analyzer status (GET on source):** `{details.get('status')}`")
+        lines.append(f"- **Source `projectId` from analyzer tags:** `{details.get('project_id_from_tags')}`")
+        lines.append(f"- **`SOURCE_PROJECT_ID` (from .env, informational):** `{details.get('project_id_from_env')}`")
+        lines.append(f"- **Copied analyzer `projectId` (from target list tags):** `{list_projects.get('copied')}`")
+        lines.append(f"- **Native analyzer `projectId` (from target list tags):** `{list_projects.get('native')}`")
+        lines.append("")
+        lines.append(
+            "If the copied analyzer's `projectId` is set but get-by-id returns 404, "
+            "this reproduces the customer-reported behavior where list surfaces "
+            "project-scoped analyzers that get-by-id cannot resolve."
+        )
+        lines.append("")
+
     lines.append("## Copy call")
     lines.append("")
     lines.append(f"- Initial HTTP status: **{copy_info.get('initial_status')}**")
@@ -457,28 +611,34 @@ def write_report(settings: Settings, run_id: str) -> Path:
     lines.append("")
     lines.append("## Get-by-id on copied analyzer (entra auth)")
     lines.append("")
-    if copied_get:
-        lines.append(f"- HTTP status: **{copied_get['get_status']}**")
-        lines.append(f"- `x-ms-request-id`: `{copied_get['get_x_ms_request_id']}`")
-        lines.append(f"- `apim-request-id`: `{copied_get['get_apim_request_id']}`")
-        lines.append(f"- `x-ms-region`: `{copied_get['get_x_ms_region']}`")
-    else:
+    for label, row in (("primary", copied_primary), ("preview", copied_preview)):
+        if row is None:
+            continue
+        lines.append(f"### api-version = `{row['api_version']}` ({label})")
+        lines.append("")
+        lines.append(f"- HTTP status: **{row['get_status']}**")
+        lines.append(f"- `x-ms-request-id`: `{row['get_x_ms_request_id']}`")
+        lines.append(f"- `apim-request-id`: `{row['get_apim_request_id']}`")
+        lines.append(f"- `x-ms-region`: `{row['get_x_ms_region']}`")
+        lines.append("")
+    if copied_primary is None:
         lines.append("_Copied analyzer was not verified — see events in state.json._")
-    lines.append("")
+        lines.append("")
     lines.append("## Diagnostic matrix (target resource)")
     lines.append("")
-    lines.append("| Analyzer | Auth | List present? | List status | GET by-id | analyze-by-id |")
-    lines.append("|---|---|---|---|---|---|")
+    lines.append("| Analyzer | Auth | api-version | List present? | List status | List projectId | GET by-id | analyze-by-id |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for r in matrix:
+        analyze_cell = r['analyze_status'] if r['analyze_status'] is not None else "—"
         lines.append(
-            f"| `{r['analyzer_id']}` ({r['kind']}) | {r['auth']} | "
+            f"| `{r['analyzer_id']}` ({r['kind']}) | {r['auth']} | `{r['api_version']}` | "
             f"{'yes' if r['list_present'] else 'no'} | {r['list_status']} | "
-            f"{r['get_status']} | {r['analyze_status']} |"
+            f"{r.get('list_project_id')} | {r['get_status']} | {analyze_cell} |"
         )
     lines.append("")
     lines.append("## Timestamps and request IDs")
     lines.append("")
-    lines.append(f"All HTTP calls (start/end UTC, headers, bodies) are in `{_log_path(run_id).as_posix()}`.")
+    lines.append(f"All HTTP calls (start/end UTC, headers, bodies, api-version) are in `{_log_path(run_id).as_posix()}`.")
     lines.append("")
     lines.append(
         "Share this report and the NDJSON log with your Azure support contact — "
@@ -500,6 +660,15 @@ def write_report(settings: Settings, run_id: str) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Azure AI Content Understanding copy-analyzer test harness.")
     parser.add_argument("--run-id", help="Reuse an existing run id; defaults to a UTC timestamp.")
+    parser.add_argument(
+        "--mode",
+        choices=("account", "project-scoped"),
+        default="account",
+        help=(
+            "account (default): PUT a fresh source analyzer via account scope. "
+            "project-scoped: reuse an existing portal-created SOURCE_ANALYZER_ID and verify against both api-versions."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name, help_text in [
@@ -533,9 +702,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     _run_dir(run_id).mkdir(parents=True, exist_ok=True)
 
     settings = Settings.load()
+    if args.mode == "project-scoped" and not settings.source_analyzer_id:
+        print(
+            "ERROR: --mode project-scoped requires SOURCE_ANALYZER_ID in .env "
+            "(the id of an existing portal-created analyzer on the source resource).",
+            file=sys.stderr,
+        )
+        return 2
     fn = COMMANDS[args.command]
     try:
-        result = fn(settings, run_id)
+        result = fn(settings, run_id, args.mode)
     except CUHttpError as exc:
         print(f"HTTP error: {exc}", file=sys.stderr)
         return 2
@@ -546,7 +722,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     if args.command != "run-all":
-        print(f"[ok] {args.command} finished. Run id: {run_id}")
+        print(f"[ok] {args.command} finished. Run id: {run_id} (mode={args.mode})")
         if isinstance(result, Path):
             print(f"     Report: {result}")
     return 0
