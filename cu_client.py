@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import requests
-from azure.identity import DefaultAzureCredential
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
 
 CAPTURED_HEADERS = (
     "x-ms-request-id",
@@ -103,7 +103,7 @@ class CUClient:
         config: ResourceConfig,
         api_version: str,
         logger: HttpLogger,
-        credential: Optional[DefaultAzureCredential] = None,
+        credential: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.api_version = api_version

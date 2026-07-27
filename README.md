@@ -138,6 +138,107 @@ Together they give the service team enough to pull backend logs for both the cop
 | Copy LRO stays `Running` past 10 minutes | The poller times out; bump `timeout_s` in `cu_client.py::poll_operation` or inspect the last polled body in `http_log.ndjson`. |
 | Copy succeeds but verdict is "Failed" | That's the reproduction — check the diagnostic matrix in `report.md` to see which api-version's get-by-id returned 404. Share the report + NDJSON log with Azure support. |
 
+## SPN role-scope probe
+
+Separate from the copy-bug matrix, the harness ships a `spn-probe` subcommand
+that answers a specific customer question:
+
+> What exact role and scope does a service principal need to resolve a
+> project-scoped analyzer by id and run `:analyze`? Is a project-scoped
+> `Azure AI User` assignment sufficient, or is a specific Content
+> Understanding / project role required?
+
+`spn-probe` runs three calls against the **target** resource under
+`API_VERSION` only, authenticated as a client-credential SPN (not your
+signed-in user):
+
+1. `GET /analyzers` — does the analyzer id even show up in the list?
+2. `GET /analyzers/{id}` — the direct resolve.
+3. `POST /analyzers/{id}:analyze` — the real workload call.
+
+Each probe tolerates `403` and `404` so failure modes are **captured**, not
+thrown. That's what makes this useful: a `403` vs a `404` is the whole answer
+to the customer question.
+
+- `403` — token was rejected at RBAC. Role/scope insufficient for that
+  data-plane call.
+- `404` — token was accepted (authentication passed) but the analyzer id is
+  not resolvable for this principal. This is the fingerprint of a
+  project-scoped analyzer the SPN can't see under its current role/scope.
+- `200` on get-by-id + `202` on analyze — sufficient.
+
+### Setup
+
+1. Create an SPN in the tenant that owns your Foundry resources:
+   ```powershell
+   az ad sp create-for-rbac --name "cu-copy-analyzer-probe" --skip-assignment
+   ```
+   Copy the `appId`, `password`, and `tenant` into `.env`:
+   ```
+   SPN_TENANT_ID=<tenant>
+   SPN_CLIENT_ID=<appId>
+   SPN_CLIENT_SECRET=<password>
+   ```
+
+2. Have a target analyzer id ready. Either reuse a `--run-id` from a run that
+   already did `copy` (the harness reads `target_analyzer_id` from
+   `state.json`), pass `--analyzer-id <id>` explicitly, or set
+   `TARGET_ANALYZER_ID` in `.env`.
+
+### Recipe — three role scenarios
+
+Before each run, update `SPN_ROLES_NOTE` in `.env` so the resulting
+`spn_probe.md` labels which scenario it corresponds to. Wait ~60s after
+each role change for Azure RBAC to propagate.
+
+Let `$SPN_OID = az ad sp show --id <SPN_CLIENT_ID> --query id -o tsv` and
+`$TARGET_RID = <TARGET_RESOURCE_ID>`. The Foundry project sub-scope is
+`$TARGET_RID/projects/<project-name>`.
+
+**Scenario 1 — `Azure AI User` at project sub-scope only (the customer's hypothesis):**
+```powershell
+$env:SPN_ROLES_NOTE = "Azure AI User @ project sub-scope only"
+az role assignment create --assignee $SPN_OID --role "Azure AI User" `
+  --scope "$TARGET_RID/projects/<project-name>"
+python repro.py --run-id $RID spn-probe
+```
+
+**Scenario 2 — `Cognitive Services User` at account scope only (baseline):**
+```powershell
+# remove scenario 1's assignment first
+az role assignment delete --assignee $SPN_OID --role "Azure AI User" `
+  --scope "$TARGET_RID/projects/<project-name>"
+
+$env:SPN_ROLES_NOTE = "Cognitive Services User @ account scope only"
+az role assignment create --assignee $SPN_OID --role "Cognitive Services User" `
+  --scope "$TARGET_RID"
+python repro.py --run-id $RID spn-probe
+```
+
+**Scenario 3 — both simultaneously:**
+```powershell
+$env:SPN_ROLES_NOTE = "Azure AI User @ project + Cognitive Services User @ account"
+az role assignment create --assignee $SPN_OID --role "Azure AI User" `
+  --scope "$TARGET_RID/projects/<project-name>"
+python repro.py --run-id $RID spn-probe
+```
+
+Each run writes `runs/<RUN_ID>/spn_probe.md` with the probe matrix,
+`x-ms-request-id` values, region headers, projectId tags, and a verdict.
+The full HTTP traces (labels prefixed `spn:`) land in the same
+`http_log.ndjson` as everything else. Send **all three** `spn_probe.md`
+files plus the NDJSON log to Azure support — together they empirically
+answer the role/scope question.
+
+### Cleanup
+
+```powershell
+az role assignment delete --assignee $SPN_OID --role "Azure AI User" `
+  --scope "$TARGET_RID/projects/<project-name>"
+az role assignment delete --assignee $SPN_OID --role "Cognitive Services User" `
+  --scope "$TARGET_RID"
+```
+
 ## Files
 
 | File | Purpose |

@@ -35,6 +35,11 @@ from dotenv import load_dotenv
 
 from cu_client import CUClient, CUHttpError, HttpLogger, ResourceConfig
 
+try:
+    from azure.identity import ClientSecretCredential
+except ImportError:  # pragma: no cover
+    ClientSecretCredential = None  # type: ignore[assignment]
+
 ANALYZE_SAMPLE_URL = (
     "https://github.com/Azure-Samples/azure-ai-content-understanding-python/raw/refs/heads/main/data/invoice.pdf"
 )
@@ -46,6 +51,14 @@ ANALYZE_SAMPLE_URL = (
 
 
 @dataclass
+class SPNConfig:
+    tenant_id: str
+    client_id: str
+    client_secret: str
+    roles_note: str = ""
+
+
+@dataclass
 class Settings:
     api_version: str
     preview_api_version: str
@@ -54,6 +67,7 @@ class Settings:
     target_key: Optional[str]
     source_analyzer_id: str
     source_project_id: Optional[str]
+    spn: Optional[SPNConfig] = None
 
     @staticmethod
     def load() -> "Settings":
@@ -82,6 +96,21 @@ class Settings:
         target_key = os.getenv("TARGET_KEY") or None
         source_analyzer_id = _require_env("SOURCE_ANALYZER_ID")
         source_project_id = os.getenv("SOURCE_PROJECT_ID") or None
+
+        spn: Optional[SPNConfig] = None
+        spn_tenant = os.getenv("SPN_TENANT_ID")
+        spn_client = os.getenv("SPN_CLIENT_ID")
+        spn_secret = os.getenv("SPN_CLIENT_SECRET")
+        if spn_tenant and spn_client and spn_secret and not any(
+            v.startswith("<") for v in (spn_tenant, spn_client, spn_secret)
+        ):
+            spn = SPNConfig(
+                tenant_id=spn_tenant,
+                client_id=spn_client,
+                client_secret=spn_secret,
+                roles_note=os.getenv("SPN_ROLES_NOTE", "").strip(),
+            )
+
         return Settings(
             api_version=api_version,
             preview_api_version=preview_api_version,
@@ -90,6 +119,7 @@ class Settings:
             target_key=target_key,
             source_analyzer_id=source_analyzer_id,
             source_project_id=source_project_id,
+            spn=spn,
         )
 
 
@@ -118,6 +148,10 @@ def _log_path(run_id: str) -> Path:
 
 def _report_path(run_id: str) -> Path:
     return _run_dir(run_id) / "report.md"
+
+
+def _spn_probe_report_path(run_id: str) -> Path:
+    return _run_dir(run_id) / "spn_probe.md"
 
 
 def _load_state(run_id: str) -> dict:
@@ -384,6 +418,244 @@ def cmd_cleanup(settings: Settings, run_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SPN role-scope probe
+# ---------------------------------------------------------------------------
+
+
+def _resolve_probe_analyzer_id(settings: Settings, run_id: str, override: Optional[str]) -> str:
+    if override:
+        return override
+    state = _load_state(run_id)
+    copied = (state.get("copy") or {}).get("target_analyzer_id")
+    if copied:
+        return copied
+    ids = state.get("analyzers") or {}
+    if ids.get("copied"):
+        return ids["copied"]
+    env_id = os.getenv("TARGET_ANALYZER_ID")
+    if env_id and not env_id.startswith("<"):
+        return env_id
+    raise SystemExit(
+        "spn-probe: could not resolve target analyzer id. Pass --analyzer-id, "
+        "use --run-id from a run that included copy, or set TARGET_ANALYZER_ID in .env."
+    )
+
+
+def _make_spn_target_client(settings: Settings, run_id: str) -> CUClient:
+    if settings.spn is None:
+        raise SystemExit(
+            "spn-probe: SPN_TENANT_ID / SPN_CLIENT_ID / SPN_CLIENT_SECRET must all be set in .env."
+        )
+    if ClientSecretCredential is None:  # pragma: no cover
+        raise SystemExit("azure-identity is not installed; run `pip install -r requirements.txt`.")
+    credential = ClientSecretCredential(
+        tenant_id=settings.spn.tenant_id,
+        client_id=settings.spn.client_id,
+        client_secret=settings.spn.client_secret,
+    )
+    logger = HttpLogger(_log_path(run_id))
+    # Force entra auth for SPN probe regardless of TARGET_AUTH_MODE — the whole
+    # point is to test bearer-token behavior, not the Ocp-Apim key path.
+    target_cfg = ResourceConfig(
+        name="target",
+        endpoint=settings.target.endpoint,
+        resource_id=settings.target.resource_id,
+        region=settings.target.region,
+        auth_mode="entra",
+        key=None,
+    )
+    return CUClient(target_cfg, settings.api_version, logger, credential=credential)
+
+
+def cmd_spn_probe(settings: Settings, run_id: str, analyzer_id_override: Optional[str] = None) -> dict:
+    analyzer_id = _resolve_probe_analyzer_id(settings, run_id, analyzer_id_override)
+    tgt = _make_spn_target_client(settings, run_id)
+    roles_note = (settings.spn.roles_note if settings.spn else "") or "(unset)"
+
+    print(f"[spn-probe] target={settings.target.endpoint} analyzer={analyzer_id}")
+    print(f"[spn-probe] roles_note={roles_note!r} api_version={settings.api_version}")
+
+    # 1) list — does the id show up at all for this principal?
+    list_resp = tgt.list_analyzers(label=f"spn:list:{analyzer_id}")
+    list_ids = _extract_analyzer_ids(list_resp.body)
+    list_status_for_id = _list_shows_status(list_resp.body, analyzer_id)
+    list_project_id = _list_shows_project_id(list_resp.body, analyzer_id)
+
+    # 2) get-by-id — the direct resolve
+    get_resp = tgt.get_analyzer(
+        analyzer_id,
+        tolerate_404=True,
+        label=f"spn:get-by-id:{analyzer_id}",
+    )
+    get_project_id: Optional[str] = None
+    if isinstance(get_resp.body, dict):
+        tags = get_resp.body.get("tags")
+        if isinstance(tags, dict):
+            get_project_id = tags.get("projectId")
+
+    # 3) analyze — the real workload call
+    try:
+        analyze_resp = tgt.analyze(analyzer_id, ANALYZE_SAMPLE_URL, tolerate_404=True)
+        analyze_status = analyze_resp.status
+        analyze_headers = analyze_resp.headers
+        analyze_body_snippet = _snippet(analyze_resp.raw_text)
+    except CUHttpError as exc:
+        # Capture 403 without raising — that IS the answer for some role combos.
+        analyze_status = exc.status
+        analyze_headers = {}
+        analyze_body_snippet = _snippet(exc.body)
+
+    def _summarise_probe(label: str, status: int, headers: dict, body_snippet: str) -> dict:
+        return {
+            "probe": label,
+            "status": status,
+            "x_ms_request_id": headers.get("x-ms-request-id"),
+            "apim_request_id": headers.get("apim-request-id"),
+            "x_ms_region": headers.get("x-ms-region"),
+            "body_snippet": body_snippet,
+        }
+
+    probes = [
+        {
+            **_summarise_probe(
+                "spn:list",
+                list_resp.status,
+                list_resp.headers,
+                _snippet(list_resp.raw_text),
+            ),
+            "list_present": analyzer_id in list_ids,
+            "list_status": list_status_for_id,
+            "list_project_id": list_project_id,
+        },
+        {
+            **_summarise_probe(
+                "spn:get-by-id",
+                get_resp.status,
+                get_resp.headers,
+                _snippet(get_resp.raw_text),
+            ),
+            "get_project_id": get_project_id,
+        },
+        {
+            **_summarise_probe("spn:analyze", analyze_status, analyze_headers, analyze_body_snippet),
+        },
+    ]
+
+    verdict = _interpret_spn_probes(probes)
+    state = _load_state(run_id)
+    state["spn_probe"] = {
+        "analyzer_id": analyzer_id,
+        "api_version": settings.api_version,
+        "roles_note": roles_note,
+        "probes": probes,
+        "verdict": verdict,
+    }
+    state["events"].append({"step": "spn-probe", "verdict": verdict, "roles_note": roles_note})
+    _save_state(run_id, state)
+
+    for p in probes:
+        print(
+            f"[spn-probe] {p['probe']:<16} status={p['status']} "
+            f"x-ms-request-id={p.get('x_ms_request_id')}"
+        )
+    print(f"[spn-probe] verdict: {verdict}")
+
+    report_path = _write_spn_probe_report(settings, run_id)
+    print(f"[spn-probe] report: {report_path}")
+    return state
+
+
+def _snippet(text: Optional[str], limit: int = 240) -> str:
+    if not text:
+        return ""
+    single_line = " ".join(text.split())
+    return single_line if len(single_line) <= limit else single_line[: limit - 1] + "…"
+
+
+def _interpret_spn_probes(probes: list[dict]) -> str:
+    by_label = {p["probe"]: p for p in probes}
+    get_status = by_label.get("spn:get-by-id", {}).get("status")
+    analyze_status = by_label.get("spn:analyze", {}).get("status")
+    if get_status == 200 and analyze_status == 202:
+        return "SPN can resolve and analyze the project-scoped analyzer under the current role assignment"
+    if get_status == 403 or analyze_status == 403:
+        return "SPN rejected at RBAC (403) — role/scope insufficient for this data-plane call"
+    if get_status == 404 or analyze_status == 404:
+        return "SPN authenticated but analyzer id was not resolvable (404) — token accepted, project scope not visible"
+    return f"SPN probe inconclusive (get={get_status}, analyze={analyze_status})"
+
+
+def _write_spn_probe_report(settings: Settings, run_id: str) -> Path:
+    state = _load_state(run_id)
+    probe_state = state.get("spn_probe") or {}
+    probes: list[dict] = probe_state.get("probes") or []
+
+    lines: list[str] = []
+    lines.append(f"# CU SPN Role-Scope Probe — {run_id}")
+    lines.append("")
+    lines.append(f"**Verdict:** {probe_state.get('verdict')}")
+    lines.append("")
+    lines.append("## Test setup")
+    lines.append("")
+    lines.append(f"- Target endpoint: `{settings.target.endpoint}`")
+    lines.append(f"- Target resource ID: `{settings.target.resource_id}`")
+    lines.append(f"- Target region: {settings.target.region}")
+    lines.append(f"- api-version: `{probe_state.get('api_version')}`")
+    lines.append(f"- Analyzer id probed: `{probe_state.get('analyzer_id')}`")
+    lines.append(f"- SPN tenant: `{settings.spn.tenant_id if settings.spn else '(none)'}`")
+    lines.append(f"- SPN client id: `{settings.spn.client_id if settings.spn else '(none)'}`")
+    lines.append(f"- `SPN_ROLES_NOTE` (current role assignment being tested): `{probe_state.get('roles_note')}`")
+    lines.append("")
+    lines.append("## Probe results")
+    lines.append("")
+    lines.append("| Probe | HTTP status | x-ms-request-id | x-ms-region | Notes |")
+    lines.append("|---|---|---|---|---|")
+    for p in probes:
+        note_bits: list[str] = []
+        if p["probe"] == "spn:list":
+            note_bits.append(f"list_present={p.get('list_present')}")
+            if p.get("list_status") is not None:
+                note_bits.append(f"list_status={p.get('list_status')}")
+            if p.get("list_project_id"):
+                note_bits.append(f"projectId={p.get('list_project_id')}")
+        elif p["probe"] == "spn:get-by-id" and p.get("get_project_id"):
+            note_bits.append(f"projectId={p.get('get_project_id')}")
+        notes = "; ".join(note_bits) or "—"
+        lines.append(
+            f"| `{p['probe']}` | **{p['status']}** | `{p.get('x_ms_request_id')}` | "
+            f"`{p.get('x_ms_region')}` | {notes} |"
+        )
+    lines.append("")
+
+    lines.append("## Response body snippets")
+    lines.append("")
+    for p in probes:
+        lines.append(f"### `{p['probe']}` → {p['status']}")
+        lines.append("")
+        lines.append("```")
+        lines.append(p.get("body_snippet") or "(empty)")
+        lines.append("```")
+        lines.append("")
+
+    lines.append("## How to read this")
+    lines.append("")
+    lines.append(
+        "- **200 on get-by-id + 202 on analyze** — the current role assignment is sufficient for the SPN.\n"
+        "- **403 on either** — the token was rejected at RBAC. The role/scope does not grant that data-plane call.\n"
+        "- **404 on get-by-id** — the token was accepted (authentication passed) but the analyzer id is not resolvable "
+        "for this principal. This is the fingerprint of a project-scoped analyzer that the SPN has no visibility into "
+        "under its current role/scope.\n"
+        "- Cross-reference the `x-ms-request-id` values above with `http_log.ndjson` and share both files with Azure "
+        "support so they can pull backend logs."
+    )
+    lines.append("")
+
+    p = _spn_probe_report_path(run_id)
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+# ---------------------------------------------------------------------------
 # run-all + report
 # ---------------------------------------------------------------------------
 
@@ -540,6 +812,18 @@ def build_parser() -> argparse.ArgumentParser:
     ]:
         sp = sub.add_parser(name, help=help_text)
         sp.set_defaults(command=name)
+
+    spn = sub.add_parser(
+        "spn-probe",
+        help="Probe TARGET (list, get-by-id, analyze) as a service principal to test role/scope requirements.",
+    )
+    spn.add_argument(
+        "--analyzer-id",
+        default=None,
+        help="Analyzer id to probe on the target. Defaults to the copied analyzer from state.json, "
+             "then falls back to TARGET_ANALYZER_ID from .env.",
+    )
+    spn.set_defaults(command="spn-probe")
     return parser
 
 
@@ -550,6 +834,7 @@ COMMANDS = {
     "verify": cmd_verify,
     "run-all": cmd_run_all,
     "cleanup": cmd_cleanup,
+    "spn-probe": cmd_spn_probe,
 }
 
 
@@ -561,7 +846,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     settings = Settings.load()
     fn = COMMANDS[args.command]
     try:
-        result = fn(settings, run_id)
+        if args.command == "spn-probe":
+            result = fn(settings, run_id, getattr(args, "analyzer_id", None))
+        else:
+            result = fn(settings, run_id)
     except CUHttpError as exc:
         print(f"HTTP error: {exc}", file=sys.stderr)
         return 2
