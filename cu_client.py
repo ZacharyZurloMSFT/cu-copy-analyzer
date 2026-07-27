@@ -135,9 +135,10 @@ class CUClient:
 
     # ---- core request -------------------------------------------------------
 
-    def _url(self, path: str) -> str:
+    def _url(self, path: str, api_version: Optional[str] = None) -> str:
         sep = "&" if "?" in path else "?"
-        return f"{self.config.endpoint}/contentunderstanding{path}{sep}api-version={self.api_version}"
+        ver = api_version or self.api_version
+        return f"{self.config.endpoint}/contentunderstanding{path}{sep}api-version={ver}"
 
     def _request(
         self,
@@ -148,8 +149,10 @@ class CUClient:
         tolerate_statuses: Iterable[int] = (),
         auth_override: Optional[str] = None,
         label: Optional[str] = None,
+        api_version_override: Optional[str] = None,
     ) -> CUResponse:
-        url = self._url(path)
+        effective_api_version = api_version_override or self.api_version
+        url = self._url(path, api_version=api_version_override)
         headers = {"Accept": "application/json"}
         headers.update(self._auth_headers(auth_override))
         if json_body is not None:
@@ -166,6 +169,7 @@ class CUClient:
                 "label": label,
                 "method": method,
                 "url": url,
+                "api_version": effective_api_version,
                 "request_body": json_body,
                 "auth_mode": auth_override or self.config.auth_mode,
                 "start_utc": start,
@@ -189,6 +193,7 @@ class CUClient:
             "label": label,
             "method": method,
             "url": url,
+            "api_version": effective_api_version,
             "request_body": json_body,
             "auth_mode": auth_override or self.config.auth_mode,
             "start_utc": start,
@@ -230,6 +235,7 @@ class CUClient:
         tolerate_404: bool = False,
         auth_override: Optional[str] = None,
         label: Optional[str] = None,
+        api_version_override: Optional[str] = None,
     ) -> CUResponse:
         tolerated: tuple[int, ...] = (404,) if tolerate_404 else ()
         return self._request(
@@ -238,6 +244,7 @@ class CUClient:
             tolerate_statuses=tolerated,
             auth_override=auth_override,
             label=label or f"get:{analyzer_id}",
+            api_version_override=api_version_override,
         )
 
     def list_analyzers(self, *, label: Optional[str] = None) -> CUResponse:

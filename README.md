@@ -8,20 +8,27 @@ The harness talks to the Content Understanding REST API directly (no SDK) so you
 
 ## What this tests
 
+The harness supports two modes:
+
+- **`--mode account`** (default): creates a fresh custom analyzer on the **source** resource via account-scope `PUT /analyzers/{id}`, copies it, and verifies. Good baseline.
+- **`--mode project-scoped`**: reuses an existing portal-created (project-scoped) analyzer on the source, copies it to the target, and probes get-by-id on the copied analyzer under **both** api-versions. This reproduces the customer-reported symptom where a project-scoped copied analyzer surfaces in `GET /analyzers` (list) but `GET /analyzers/{id}` returns **404** on both `2025-11-01` and `2026-06-01-preview`.
+
 Given two Foundry resources (a **source** and a **target**), `run-all` does the following on your behalf:
 
-1. Creates a small custom analyzer on the **source** resource and waits for it to become `ready`.
+1. Creates a small custom analyzer on the **source** resource and waits for it to become `ready` — OR, in project-scoped mode, verifies the pre-existing `SOURCE_ANALYZER_ID` is ready and captures its `projectId` tag.
 2. Creates the same analyzer natively on the **target** resource (a control) and waits for it to become `ready`.
 3. Grants copy authorization on the source.
 4. Copies source → target and polls the copy operation to completion.
 5. On the target, runs a diagnostic matrix for both the **copied** analyzer and the **native** control:
 
-   | Analyzer | List shows it? | GET by-id | analyze-by-id |
-   |---|---|---|---|
-   | copied  | expect `ready` | expect 200 | expect 202 |
-   | native  | expect `ready` | expect 200 | expect 202 |
+   | Analyzer | Auth | api-version | List shows it? | GET by-id | analyze-by-id |
+   |---|---|---|---|---|---|
+   | copied  | entra | primary | expect `ready` | expect 200 | expect 202 |
+   | copied  | entra | preview _(project-scoped only)_ | expect `ready` | expect 200 | — |
+   | copied  | key _(if `TARGET_KEY` set)_ | primary | expect `ready` | expect 200 | — |
+   | native  | entra | primary | expect `ready` | expect 200 | expect 202 |
 
-6. Writes a `report.md` with the diagnostic matrix, request IDs, timestamps, region headers, and a verdict of either **Copy Pipeline Succeeded** or **Copy Pipeline Failed**.
+6. Writes a `report.md` with the diagnostic matrix, request IDs, timestamps, region headers, list-tag `projectId`, and a verdict of either **Copy Pipeline Succeeded** or **Copy Pipeline Failed**.
 
 If you also provide the target's API key in `.env`, the harness re-runs the copied-analyzer get-by-id **twice** — once under Entra token auth, once under API-key auth — to isolate whether any failure is auth-path specific.
 
@@ -74,7 +81,10 @@ Copy-Item .env.example .env     # macOS/Linux: cp .env.example .env
 | `SOURCE_AUTH_MODE` | no | `entra` (default) or `key` |
 | `SOURCE_KEY` | if `SOURCE_AUTH_MODE=key` | Ocp-Apim key for the source |
 | `TARGET_ENDPOINT` / `TARGET_RESOURCE_ID` / `TARGET_REGION` / `TARGET_AUTH_MODE` / `TARGET_KEY` | same as above | For the target resource |
-| `API_VERSION` | no | Defaults to `2025-11-01` |
+| `API_VERSION` | no | Primary api-version. Defaults to `2025-11-01`. |
+| `PREVIEW_API_VERSION` | no | Second api-version probed during **project-scoped** verify. Defaults to `2026-06-01-preview`. |
+| `SOURCE_ANALYZER_ID` | if `--mode project-scoped` | Id of an existing portal-created analyzer on the source resource (e.g. `LSC_LP_Test1`). The harness will not PUT/create it — it copies it as-is. |
+| `SOURCE_PROJECT_ID` | no | Informational only — surfaced in `report.md`. The actual project scoping is determined by the portal-created analyzer itself. |
 | `COMPLETION_MODEL` | no | Completion model name for the `generate` field. Defaults to `gpt-4o-mini`. Must be deployed on **both** resources. |
 | `EMBEDDING_MODEL` | no | Embedding model name. Defaults to `text-embedding-3-large`. Must be deployed on **both** resources. |
 | `ANALYZER_BASE_NAME` | no | Prefix for the analyzer IDs the harness creates. Defaults to `cu_copy_repro`. |
@@ -86,7 +96,12 @@ Copy-Item .env.example .env     # macOS/Linux: cp .env.example .env
 ### End-to-end (recommended)
 
 ```powershell
+# Default: account-scope source (fresh PUT), matches original harness behavior.
 python repro.py run-all
+
+# Project-scoped: reuse an existing portal-created analyzer on the source.
+# Requires SOURCE_ANALYZER_ID (and optionally SOURCE_PROJECT_ID) in .env.
+python repro.py --mode project-scoped run-all
 ```
 
 At the end you'll see either
@@ -125,7 +140,7 @@ State is persisted between subcommands in `runs/<RUN_ID>/state.json`.
 python repro.py --run-id $RID cleanup
 ```
 
-Deletes the three analyzers the harness created on the two resources. 404s are tolerated.
+Deletes the three analyzers the harness created on the two resources. 404s are tolerated. In **project-scoped** mode the source analyzer is **not** deleted (it's customer-owned) — only the native control and the copied analyzer on the target are removed.
 
 ## What to send back to Azure support
 
