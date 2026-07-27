@@ -219,15 +219,6 @@ class CUClient:
 
     # ---- analyzer operations ------------------------------------------------
 
-    def create_or_replace_analyzer(self, analyzer_id: str, body: dict) -> CUResponse:
-        return self._request(
-            "PUT",
-            f"/analyzers/{analyzer_id}",
-            json_body=body,
-            tolerate_statuses=(201, 202),
-            label=f"create:{analyzer_id}",
-        )
-
     def get_analyzer(
         self,
         analyzer_id: str,
@@ -315,15 +306,6 @@ class CUClient:
 
     # ---- polling helpers ----------------------------------------------------
 
-    def poll_analyzer_ready(self, analyzer_id: str, *, timeout_s: int = 300) -> CUResponse:
-        """Poll GET /analyzers/{id} until status is ready/succeeded/failed or timeout."""
-        return self._poll(
-            fn=lambda: self.get_analyzer(analyzer_id, label=f"poll-get:{analyzer_id}"),
-            done=_analyzer_terminal,
-            timeout_s=timeout_s,
-            what=f"analyzer {analyzer_id}",
-        )
-
     def poll_operation(self, operation_location: str, *, timeout_s: int = 600) -> CUResponse:
         """Poll a service-returned Operation-Location URL until terminal."""
         if not operation_location:
@@ -373,13 +355,6 @@ class CUClient:
                 raise TimeoutError(f"Timed out after {timeout_s}s polling {what}; last body={last.body!r}")
             time.sleep(delay)
             delay = min(delay * 2, 15.0)
-
-
-def _analyzer_terminal(resp: CUResponse) -> bool:
-    if resp.status != 200 or not isinstance(resp.body, dict):
-        return False
-    status = str(resp.body.get("status", "")).lower()
-    return status in {"ready", "succeeded", "failed", "canceled", "cancelled"}
 
 
 def _operation_terminal(resp: CUResponse) -> bool:
